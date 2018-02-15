@@ -1,5 +1,7 @@
-# Stat Arb HW3 11.01.17
-# Attempt #2
+# Stat Arb - European Indices Constituents
+#   Written with scalability and universe changes in mind
+# author: Danny Ferdman
+# date: 02/15/2018
 
 require(data.table)
 require(lubridate)
