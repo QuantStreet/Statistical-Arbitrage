@@ -92,19 +92,6 @@ empCovMats <- lapply(firstDays, function(x){
   S_Mat <- Reduce('+', omegaList) / length(omegaList)
   # S_Mat <- apply(simplify2array(omegaList), 1:2, function(x) mean(x, na.rm = T)) #More correct but takes longer to run
   
-  sq_omega <- mean(sapply(omegaList, function(x) {sum((x - S_Mat)^2, na.rm = T)})) 
-  
-  # delta is dispersion
-  # delta plus estimation is total var
-  # shrinkage target is the scaled identity matrix:
-  avg_Var <- mean(apply(pastYrUniv, 2, function(x) var(x, na.rm = T)))
-  scaledIden <- avg_Var * diag(length(activeUniv))
-  sq_delta <- sum((S_Mat - scaledIden)^2)
-  totalVar <- sq_omega + sq_delta
-  
-  shrinkBeta <- 1 - sq_omega / totalVar
-  covMat <- var(pastYrUniv, na.rm = T)
-  shrunkCovMat <- (1 - shrinkBeta) * scaledIden + shrinkBeta * covMat
   
   # Alphas:
   # Easier to implement in a for loop!!!
