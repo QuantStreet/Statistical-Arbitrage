@@ -92,16 +92,14 @@ empCovMats <- lapply(firstDays, function(x){
   S_Mat <- Reduce('+', omegaList) / length(omegaList)
   # S_Mat <- apply(simplify2array(omegaList), 1:2, function(x) mean(x, na.rm = T)) #More correct but takes longer to run
   
-  
+  # 2.26.18 Removed code chunk here!!!!
   # Alphas:
   # Easier to implement in a for loop!!!
   
   
   cat('\r', as.character(myDate[x, Date]), paste(dim(pastYrUniv)))
   
-  return(list('Beta' = shrinkBeta, 
-              'covMat' = covMat, 
-              'shrCovMat' = shrunkCovMat))
+  # 2.26.18 Removed return function
   
 })
 
