@@ -1,19 +1,34 @@
 # Stat Arb - European Indices Constituents
 #   Written with scalability and universe changes in mind
 # author: Danny Ferdman
-# date: 02/15/2018
+# begin date: 02/15/2018
+# completion date: 3/12/2018
+
+# Spent time making the backtest as realistic as possible.
+#   ie: when a stock goes ex univ need to figure out how to start getting rid  of it 
+#   as soon as possible. One stock had a good alpha while the ADV kept going down
+#   and the optimizer didn't cut down the position. This created a large illiquid position.
+# 10 day ADV constraint is not binding - it is working correctly I got stuck in a large position when
+#   vol completely collapsed.
+
+# Assume all trading occurs at the last second of every trading day but the book is updated a second later
+#   and is applied over the following date for reporting and analysis.
+
+# Some aspects of the code use slightly different indexing. Need to fix it eventually.
+# As stock universe expands quad prog takes much longer to solve - main bottle neck.
+
+# Code that was deemed too valuable to be shared publicly online is replaced with bracketed text.
+
 
 require(data.table)
 require(lubridate)
-require(caTools)
-require(fastAdaboost)
 require(quadprog)
-# require(xlsx) #I have a problem with xlsx something to do with Java...
 rm(list = ls())
 gc()
 
 setwd('***')
 
+# Unpacking all the data modules from an array object
 databaseMat <- R.matlab::readMat('database.mat')
 for (i in names(databaseMat)){
   if(!i %in% c('allstocks', 'myday')) {assign(x = i, databaseMat[[i]])}
@@ -22,8 +37,6 @@ for (i in names(databaseMat)){
 
 allstocks <- allstocks[[1]]
 codesDS <- unlist(allstocks[1, , ])
-# dimnames(allstocks)[[3]] <- codeDS
-# industryDS <- unlist(allstocks[7, , ])
 industryDS <- unlist(lapply(allstocks[7, , ], function(x) x[2]))
 
 Date <- as.Date(unlist(myday), format = '%d-%b-%Y')
@@ -32,28 +45,14 @@ myDate[, YrMo := year(Date) + ((month(Date) - 1) / 12)]
 myDate[, I := as.integer(rownames(.SD))]
  
 
-# for (i in c('cap', "isactivenow", "mtbv", "price", "rec", "tcost", "tri", "volume")){
-#   assign(x = i, cbind(Date, YrMo, get(i)))
-#   setnames(get(i), c('Date', 'YrMo', codesDS))
-# }
-
 for (i in c('cap', "isactivenow", "mtbv", "price", "rec", "tcost", "tri", "volume")){
-  # assign(x = i, cbind(Date, YrMo, get(i)))
-  # setnames(get(i), codesDS)
-  # colnames(get(i)) = codesDS
   assign(i, structure(get(i), dimnames = list(NULL, codesDS)))
-  # "dimnames<-"(eval(i), list(NULL, codesDS))
   }
 
-
-# rm(list = ls()[which(!(ls() %in% c('allstocks', 'DB', 'databaseMat', )))]) # Remove unneeded objects
-# gc() # clears memory of deleted objects
-
-# ret <- copy(tri)
-# ret[, names(ret) := lapply(.SD, function(x) (x / shift(x) - 1))]
 ret <- apply(tri, 2, function(x) (x / shift(x) - 1))
-# ret <- as.matrix(ret)
-# ret[, 3:568 := lapply(.SD, function(x) ifelse(is.na(x), 0, x)), .SDcols = 3:568]
+
+cleanRet <- ret # creating a returns matrix that doesn't have NaNs for attribution purposes
+cleanRet[which(is.nan(cleanRet))] <- 0
 
 # Industry dummy matrix for alphas:
 R <- sapply(unique(industryDS), 
@@ -61,9 +60,6 @@ R <- sapply(unique(industryDS),
     as.numeric(industryDS == x)
   }
 )
-
-
-
 
 firstDays <- unlist(myDate[Date >= min(myDate$Date) + 365,
                     .SD[1, ], 
@@ -73,36 +69,25 @@ activeUniv <- sapply(setNames(firstDays, firstDays),
                      function(x) {which(unlist(isactivenow[x, ]) == 1)}, 
                      USE.NAMES = T)
 
-empCovMats <- lapply(firstDays, function(x){
-  # This is taking much longer than anticipated to run... fixed
-  # x <- firstDays[1]
+empCovMats <- lapply(firstDays, function(x){ # Empirical convariance matrices
+  
   activeUniv <- which(unlist(isactivenow[x, ]) == 1)
   
   pastYrUniv <- ret[myDate[I %between% c(x - 1 - 249, x - 1), I], activeUniv]
   pastYrUniv <- pastYrUniv[apply(pastYrUniv, 1, function(x) length(unique(x))>1),]
   
-  # Omega is estimation error:
-  omegaList <- lapply(as.data.frame(t(pastYrUniv)), #Notice the transpose to use lapply
-                      function(x){
-                        # browser()
-                        x[is.na(x)] <- 0
-                        ((x) %*% t(x))
-                      })
-  
-  S_Mat <- Reduce('+', omegaList) / length(omegaList)
-  # S_Mat <- apply(simplify2array(omegaList), 1:2, function(x) mean(x, na.rm = T)) #More correct but takes longer to run
-  
-  # 2.26.18 Removed code chunk here!!!!
-  # Alphas:
-  # Easier to implement in a for loop!!!
-  
+  # [Stable covariance estimation code omitted]
+  covMat <- var(pastYrUniv, na.rm = T)
   
   cat('\r', as.character(myDate[x, Date]), paste(dim(pastYrUniv)))
   
-  # 2.26.18 Removed return function
+  return(list('covMat' = covMat))
   
 })
 
+names(empCovMats) <- as.character(firstDays)
+
+# Alpha Signals:
 # Alpha - Momentum:
 alphaMom_all <- apply(log(1 + ret), 
                   2, 
@@ -130,8 +115,49 @@ alphaRec_all <- apply(ifelse(rec>0, 1, ifelse(rec<0, -1, 0)), 2, function(x){
                  fill = NA)
   
 })
-# Windsorization:
 
+# Average Daily Volume (used for max trade and size constraints in the optimizer)
+ADV_all <- apply(volume, 2, function(V){
+  retVal <- zoo::rollapply(V, 
+                 width = 21, 
+                 mean, 
+                 na.rm = T, 
+                 fill = NA, 
+                 align = 'right')
+  retVal <- zoo::na.locf(retVal, na.rm = F)
+  if(length(retVal) != length(V)){browser()}
+  return(retVal)
+})
+
+
+# Creating market index returns based on monthly sub universes:====
+first_ofMonth <- unlist(myDate[, .SD[1, ], 
+                              .(YrMo)][, .(I)])
+
+names(first_ofMonth) <- myDate[first_ofMonth, as.character(Date)]
+
+mktIndexRet <- lapply(first_ofMonth, function(dayInd){
+  # browser()
+  activeNow <- as.logical(isactivenow[dayInd, ])
+  
+  dayInd_end <- first_ofMonth[which(first_ofMonth == dayInd) + 1] - 1
+  if(which(first_ofMonth == dayInd) == length(first_ofMonth)) {
+    dayInd_end <- nrow(myDate)
+  }
+  retMat <- ret[dayInd:dayInd_end, activeNow]
+  
+  capMat <- cap[(dayInd-1):(dayInd_end-1), activeNow]
+  if(dayInd == 1){ capMat <- rbind(cap[1, activeNow], capMat)}
+  
+  retVal <- rowSums(retMat * capMat, na.rm = T) / rowSums(capMat, na.rm = T)
+  cat(dayInd, '\n')
+  return(retVal)
+})
+
+mktIndexRet <- unlist(mktIndexRet)
+
+# Functions:====
+# Windsorization:
 windsor <- function(vec, unit_var = F){
   # Takes only vectors
   sd_vec <- sd(vec, na.rm = T)
@@ -140,17 +166,13 @@ windsor <- function(vec, unit_var = F){
   sd_less_3 <- -3 * sd_vec + median(vec, na.rm = T)
   vec[vec > sd_3] <- sd_3
   vec[vec < sd_less_3] <- sd_less_3
-  # vec <- vec - mean(vec, na.rm = T)
-  if (unit_var == T) {vec <- (vec - median(vec)) / sd(vec, na.rm = T)}
+  if (unit_var == T) {vec <- (vec - median(vec, na.rm = T)) / sd(vec, na.rm = T)}
   return(vec)
   }
 
-
-# Alphas:
-
 wghts <- function(len){
   linB <- -1/(sum(0:len)) #linear decay beta
-  linA <- len / sum(0:len) #linear devay alpha
+  linA <- len / sum(0:len) #linear decay alpha
   
   wghts <- rev(linA + linB * (0:len))
   return(wghts[-1])
@@ -173,353 +195,444 @@ TriangularDecayMean <- function(MAT, wid, weights = NA){
   return(retVal)
 }
 
-CleanAndLag <- function(AlphaMat, mean_length = 1, mean_weights = NA, Windsorize = T, windsor_uni_var = F){
-  # Need description for the function (Clean and lags the alpha matrix)
+CleanAndDecay <- function(AlphaMat, mean_length = 1, mean_weights = NA, Windsorize = T, windsor_uni_var = F){
+  # """
+  # Clean the data and calculates a weighted mean (decay).
+  # Mainly used for the alpha signals to make the signal usable.
+  # """
+  # Removed the lagging feature
   if(is.na(mean_weights)) {
     mean_weights <- wghts(mean_length)
     }
   
-  if(mean_length == 1) {
+  if(mean_length != 1) {
     AlphaMat <- TriangularDecayMean(AlphaMat, mean_length, mean_weights)
+    AlphaMat <- AlphaMat[-(1:(mean_length - 1)), ] # The excess from taking the mean is dropped off
   }
- 
-   AlphaMat <- apply(AlphaMat, 2, shift)[-(1:mean_length), ] # The alpha is now lagged and the excess is dropped off
   
    if(Windsorize == T) {AlphaMat <- t(apply(AlphaMat, 1, windsor, unit_var = windsor_uni_var))}
+   
+   AlphaMat <- apply(AlphaMat, 2, function(x){
+     x[is.na(x)] <- 0
+     return(x)
+   })
   
   return(AlphaMat)
 }
 
-for (firstDate in firstDays[14]){
-  subUniv <- activeUniv[[as.character(firstDate)]]
-  # In-Sample:
-  BTL <- 250 # Back Test Length
-  ST_Len <- 21 # Mean revrersion triangular decay length
+subjectTo_Matrices <- function(argList) {
+  # """
+  # Creates a subject to condition matrix from a list to be
+  # used in qudaratic programming.
+  # Must supply a list of constraints for argList.
+  # Note that incorporating regex is the way to go but I cannot spend much more time on it.
+  # """
   
-  meanRev_Univ <- ret[(firstDate - BTL - ST_Len):(firstDate - 1), subUniv]
+  # [Code omitted]
   
-  subR <- R[subUniv, unique(industryDS[subUniv])]
+  QP_argVar <- do.call('rbind', lapply(matList, function(Item) Item[[1]]))
+  QP_Bounds <- do.call('rbind', lapply(matList, function(Item) Item[[2]]))
   
-  alphaMeanRev <- meanRev_Univ %*% 
-    (diag(length(subUniv)) - subR %*% solve(t(subR) %*% subR) %*% t(subR))
+  return(list(QP_argVar, QP_Bounds))
+}
+
+# Backtesting:====
+
+backtest_Port <- cleanRet * NA
+rownames(backtest_Port) <- as.character(myDate$Date)
+for (firstDate in firstDays[-(1:3)]){
+  Timer <- Sys.time()
+  isFirst <- ifelse(any(is.na(backtest_Port[firstDate - 1, ])), # checks if this is the first iteration
+                    T, 
+                    F)
+  if(isFirst == T){
+    printCounter <- 0
+    backtest_Port[firstDate - 1, ] <- 0
+  }
   
-  alphaMeanRev <- CleanAndLag(alphaMeanRev, ST_Len)
-  
-  alphaMom <- alphaMom_all[(firstDate - BTL - 1):(firstDate - 1), subUniv]
-  alphaMom <- CleanAndLag(alphaMom, 1)
-  # sub_alphaMom <- t(apply(sub_alphaMom, 1, windsor))
-  # sub_alphaMom <- apply(sub_alphaMom, 2, shift)[-1, ]# The alpha is now lagged and the excess is dropped off
-  
-  
-  Rec_Len <- 45
-  alphaRec <- alphaRec_all[(firstDate - BTL - Rec_Len):(firstDate - 1), subUniv] # Do not windsorize
-  alphaRec <- CleanAndLag(alphaRec, Rec_Len)
-  
-  alphaMTB <- mtbv[(firstDate - BTL - 1):(firstDate - 1), subUniv]
-  alphaMTB <- CleanAndLag(alphaMTB, 1)
-  
-  univRet <- ret[(firstDate - BTL):(firstDate - 1), subUniv]
-  mktCap <- cap[(firstDate - BTL-1):(firstDate - 1), subUniv]
-  laggedMktCap <- apply(mktCap, 2, shift)[-1, ]
-  mktUnivRet <- apply(univRet * laggedMktCap, 1, sum, na.rm = T) * 
-    1 / apply(laggedMktCap, 1, sum, na.rm = T)
-  
-  excUnivRet <- univRet - mktUnivRet
-  
-  # lmOut <- lm(as.vector(excUnivRet) ~ 
-  #               as.vector(alphaMeanRev) + 
-  #               as.vector(alphaMom) +
-  #               as.vector(alphaRec) + 
-  #               as.vector(alphaMTB))
-  # 
-  # lmOut <- lm(as.vector(excUnivRet) ~ 
-  #               # as.vector(alphaMeanRev) + 
-  #               as.vector(alphaMom) +
-  #               # as.vector(alphaRec) + 
-  #               as.vector(alphaMTB))
-  # 
-  # summary(lmOut)
-  
-  # xTrain <- cbind(as.vector(alphaMeanRev), 
-  #                   as.vector(alphaMom), 
-  #                   as.vector(alphaRec),  
-  #                   as.vector(alphaMTB))
-  # 
-  # trainData <- data.frame(Y = factor(as.vector(excUnivRet)), 
-  #                         A1 = as.vector(alphaMeanRev), 
-  #                         A2 = as.vector(alphaMom), 
-  #                         A3 = as.vector(alphaRec),  
-  #                         A4 = as.vector(alphaMTB))
-  # 
-  # model <- LogitBoost(xlearn = xTrain, 
-  #            ylearn =  as.vector(excUnivRet), nIter = 4)
-  
-  # LogitBoost can work on 10 levels prediction
+  index <- as.character(firstDate)
+  subUniv <- activeUniv[[index]]
+
+  # [Factor blend code omitted]
 
   # Out of Sample:
-  OOS_EndDate <- myDate[YrMo == myDate[512, YrMo], .SD[.N, I]]
-  OOS_alphaMeanRev <- ret[(firstDate - ST_Len):(OOS_EndDate), subUniv]
+  subR <- R[subUniv, unique(industryDS[subUniv])]
+  OOS_EndDate <- myDate[YrMo == myDate[firstDate, YrMo], .SD[.N, I]]
+  
+  backtest_Port[firstDate:OOS_EndDate, ] <- 0 # Initiating the values from NA to 0
+  
+  ST_Len <- 21
+  OOS_alphaMeanRev <- ret[(firstDate - ST_Len):(OOS_EndDate - 1), subUniv] # NB: not subtracting 1 from firstDate
+  #   because the ST_Len takes care of it
   
   OOS_alphaMeanRev <- OOS_alphaMeanRev %*% 
-    (diag(length(subUniv)) - subR %*% solve(t(subR) %*% subR) %*% t(subR))
+    (diag(length(subUniv)) - subR %*% solve(t(subR) %*% subR) %*% t(subR)) # demeans by industry
   
-  OOS_alphaMeanRev <- CleanAndLag(OOS_alphaMeanRev, ST_Len + 1, windsor_uni_var = T)
+  OOS_alphaMeanRev <- CleanAndDecay(OOS_alphaMeanRev, ST_Len, windsor_uni_var = T)
   
   
-  OOS_alphaMom <- alphaMom_all[(firstDate):(OOS_EndDate), subUniv]
-  OOS_alphaMom <- CleanAndLag(OOS_alphaMom, windsor_uni_var = T)
+  OOS_alphaMom <- alphaMom_all[(firstDate - 1):(OOS_EndDate - 1), subUniv]
+  OOS_alphaMom <- CleanAndDecay(OOS_alphaMom, windsor_uni_var = T)
   
-  # Rec_Len <- 45
-  OOS_alphaRec <- alphaRec_all[(firstDate - Rec_Len):OOS_EndDate, subUniv] # Do not windsorize
-  OOS_alphaRec <- CleanAndLag(OOS_alphaRec, mean_length = Rec_Len + 1, Windsorize = F)
+  Rec_Len <- 45
+  OOS_alphaRec <- alphaRec_all[(firstDate - Rec_Len):(OOS_EndDate - 1), subUniv] # Do not windsorize
+  OOS_alphaRec <- CleanAndDecay(OOS_alphaRec, mean_length = Rec_Len, Windsorize = F)
   
-  OOS_alphaMTB <- mtbv[(firstDate):OOS_EndDate, subUniv]
-  OOS_alphaMTB <- CleanAndLag(OOS_alphaMTB, windsor_uni_var = T)
+  OOS_alphaMTB <- mtbv[(firstDate - 1):(OOS_EndDate - 1), subUniv]
+  OOS_alphaMTB <- CleanAndDecay(OOS_alphaMTB, windsor_uni_var = T)
   
   # Note: the alphas are not unit variance which makes it incorrect to statically blend them...
-  OOS_AggAlpha <- .5 * OOS_alphaMeanRev + .25 * OOS_alphaRec + .15 * OOS_alphaMTB + .1 * OOS_alphaMom
+  # This area is stated for future improvement.
+  OOS_AggAlpha <- -.5 * OOS_alphaMeanRev + .25 * OOS_alphaRec - .15 * OOS_alphaMTB + .1 * OOS_alphaMom
   
-  OOS_RetMat <- ret[(firstDate + 1):(OOS_EndDate), subUniv]
+  OOS_RetMat <- ret[(firstDate):(OOS_EndDate), subUniv]
   
-  w <- rep(0, length(subUniv)) # w is the current portfolio
+  # Calculate equity betas over 250 days on a rolling basis:
+  # NB: the calculation is also used on an out of sample basis. I'm not
+  #   using the returns for the day on which the calculated beta is used.
+  rowsSelect <- (firstDate - 250):(OOS_EndDate - 1)
+  OOS_Betas <- zoo::rollapply(rowsSelect, 
+                              width = 250, 
+                              fill = NULL,
+                              align = 'right', 
+                              FUN = function(rows){
+                                apply(ret[rows, subUniv], 2, 
+                                      function(Y){
+                                        notNA <- which(!is.na(Y))
+                                        X <- cbind(1, mktIndexRet[rows][notNA])
+                                        betas <- solve(t(X) %*% X) %*% t(X) %*% Y[notNA]
+                                        return(betas[2])
+                                      }
+                                )
+                              })
   
-  # summary(lm(as.vector(OOS_RetMat) ~ as.vector(OOS_AggAlpha)))
-  # Need to define mu - risk parameter
-  mu <- .2
-  H <- 2 * mu * rbind(cbind(empCovMats[[14]][['shrCovMat']], -empCovMats[[14]][['shrCovMat']]), 
-                  cbind(-empCovMats[[14]][['shrCovMat']], empCovMats[[14]][['shrCovMat']]))
+  # mu and lambda parameters should constantly be adjusted. Future improvement.
+  mu <- 2
   
-  lambda <- .2 # lambda is the trading penalty parameter
-  g <- rbind(2 * mu * empCovMats[[14]][['shrCovMat']] %*% w - alpha + lambda * tau, 
-             -2 * mu * empCovMats[[14]][['shrCovMat']] %*% w + alpha + lambda * tau)
+  H <- 2 * mu * rbind(cbind(empCovMats[[index]][['covMat']], -empCovMats[[index]][['covMat']]),
+                  cbind(-empCovMats[[index]][['covMat']], empCovMats[[index]][['covMat']]))
+  # [Stable H omitted]
+  # T-Cost data is monthly averages
+  tau <- tcost[firstDate - 1, subUniv] / 2 
+  lambda <- 5 # lambda is the trading penalty parameter
   
-  A <- rbind(cbind(t(subR), -t(subR)), 
-             cbind(-t(subR), t(subR)))
+  for (day in (1:nrow(OOS_AggAlpha) - 1)){
+    # NB: day object starts from 0
+    alpha <- OOS_AggAlpha[day + 1, ]
+
+    # Check that ex universe holdings are liquidated:
+    if(isFirst == F & any(backtest_Port[(firstDate + day - 1), -subUniv] != 0)){ 
+      
+      # NB: I decided to ID and work with the explicit non-zero ex-univ only instead of the entire ex Universe for 
+      #   easier debugging
+      exUnivNames <- names(which(backtest_Port[(firstDate + day - 1), -subUniv] != 0))
+      exUnivMat <- backtest_Port[(firstDate + day - 1), exUnivNames]
+      
+      # Max trade and size, s/b the aggressive version of the one a few lines down
+      maxTrade <- .01 * ADV_all[(firstDate + day - 1), exUnivNames]
+      exUnivTrade <- -sign(exUnivMat) * pmin(maxTrade, abs(exUnivMat - 0))
+      backtest_Port[(firstDate + day), exUnivNames] <- 
+        backtest_Port[(firstDate + day - 1), exUnivNames] + exUnivTrade
+    } else {exUnivNames <- 0}
+    
+    w <- backtest_Port[(firstDate + day - 1), subUniv] # Begining of day portfolio
+    
+    # quadprog takes the form: min(.5*b'*D*b -d'b) s.t 
+    #                          A'b >= b0
+    
+    # Minimization setup with H/D defined outside of the loop since it doesn't change
+    g <- cbind(2 * mu * empCovMats[[index]][['covMat']] %*% w - alpha + lambda * tau, 
+               -2 * mu * empCovMats[[index]][['covMat']] %*% w + alpha + lambda * tau)
+    
+    # Constraints:
+    # Industry constraint
+    indLimit <- 100
+    indCons <- list(pmin(-indLimit * rep(1, ncol(subR)) - t(subR) %*% w, -1e-04),
+         '<', 
+         cbind(t(subR), -t(subR)), 
+         '<', 
+         pmax(1e-04, indLimit * rep(1, ncol(subR)) - t(subR) %*% w))
+    
+    # Max trade and position size constraint
+    maxTrade <- pmin(50, .01 * ADV_all[(firstDate + day - 1), subUniv])
+    # maxPosition <- 150
+    maxPosition <- pmin(150, 10 * .01 * ADV_all[(firstDate + day - 1), subUniv])
+    # NB: the lower bound is a little less than zero because a zero bound throws an error
+    #   in the solver when both bounds are the same, I think it is looking for meq option
+    #   to be specified for the bound when both bounds are the same.
+    tradeAndSize_Constraint <- list(c(pmin(-pmin(1e-04, maxPosition + w), maxTrade - 1e-04), 
+                                      pmin(-pmin(1e-04, maxPosition - w), maxTrade - 1e-04)), 
+                                    '<', 
+                                    diag(2 * length(w)), 
+                                    '<', 
+                                    c(pmax(0, pmin(maxTrade, maxPosition - w)),
+                                          pmax(0, pmin(maxTrade, maxPosition + w)))
+                                    )
+    
+    # theta = max trade size
+    # pi = max position size
+    
+    # Long-short portfolio constraint
+    LS_Constraint <- list(-(sum(w) + sum(backtest_Port[(firstDate + day), exUnivNames])), 
+                          '=', 
+                          matrix(c(rep(1, length(w)), 
+                                   rep(-1, length(w))), 
+                                 nrow = 1))
+    
+    # Beta constraint
+    mktNeutralCons <- list(-.05 * sum(abs(w)) - (w %*% OOS_Betas[day + 1, ]), 
+                           '=', 
+                           c(OOS_Betas[day + 1, ], 
+                             -OOS_Betas[day + 1, ]))
+    
+    QP_List <- subjectTo_Matrices(list(LS_Constraint
+                                       ,mktNeutralCons
+                                        ,indCons
+                                       , tradeAndSize_Constraint
+                                       ))
+
+    QP_Amat <- QP_List[[1]]
+    QP_b0 <- QP_List[[2]] 
+
+    
+    # **************************************
+    # Quadratic Programming, here we go:
+    # quadprog takes the form: min(.5*b'*D*b -d'b) s.t 
+    #                          A'b >= b0
+    # **************************************
+    
+    sol1 <- solve.QP(Dmat = H + diag(ncol(H)) * 5e-4, dvec = -g, Amat = t(QP_Amat), bvec = QP_b0, meq = 2)
+    
+    optimW <- sol1$solution
+    y <- optimW[1:(length(optimW)/2)]
+    z <- optimW[-(1:(length(optimW)/2))]
+    x <- w + y - z
+    
+    backtest_Port[firstDate + day, subUniv] <- x # Close of day portfolio/ begining of the subsequent day
+
+    if(day != 0 & abs(sum(backtest_Port[firstDate + day,])) > 1) {
+      message('error: sum of weights is not 0')
+              browser()}
+  }
+
+  cat('\r', 
+      paste(myDate[as.numeric(index), Date]), 
+      ' ', 
+      paste(round(Sys.time() - Timer, 2), attributes(Sys.time()-Timer)[1]))
+  if(printCounter < 10) {cat('\n')
+    } else if(printCounter == 10){cat('\n...\n')}
   
-  indLimit <- 100
-  b <- rbind(indLimit * rep(1, ncol(subR)) - t(subR) %*% w, 
-             -indLimit * rep(1, ncol(subR)) - t(subR) %*% w)
-  # Note, I'm not aware of a function in R that nicely reformats matrices into one matrix.
-  #   I passed on writing a function because I didn't see a way to save time by using it.
-  
-  # Country constraint omitted
-  # C <- rbind(t(eqBetas, -t(eqBetas)))
-  # 
-  # d <- -t(eqBetas) %*% w
-  ADV <-  volume[(firstDate - 21):(firstDate - 1), subUniv]# Average daily volume
-  ADV <- apply(ADV, 2, mean, na.rm = T)
-  
-  maxTrade <- .01 * ADV
-  maxPosition <- 150
-  
-  LB <- rep(0, 2 * length(subUniv)) # Lower bound
-  UB <- c(pmax(0, pmin(maxTrade, maxPosition - w)), 
-              pmax(0, pmin(maxTrade, maxPosition + w)))
-  # theta = max trade size
-  # pi = max position size
-  
-  # Quadratic Programming, here we go:
-  QP_Amat <- rbind(A, 
-                   matrix(1, ncol = 2 * length(w), nrow = 1), 
-                   matrix(1, ncol = 2 * length(w), nrow = 1))
-  QP_b0 <- rbind(-b, LB, -UB)
-  solve.QP(Dmat = H, dvec = -g, Amat = )
-  
+  printCounter <- printCounter + 1
+
 }
+
+# Results analysis and visualization:====
+
+createAxis <- function(){
+  # Labels the x-axis on the plot
+  axis(side = 1, 
+       at = which(names(OOS_cumNetRet) %in% as.character(myDate$Date[firstDays])), 
+       labels = names(OOS_cumNetRet)[names(OOS_cumNetRet) %in% as.character(myDate$Date[firstDays])], 
+       col.axis = 'blue', 
+       las = 2, 
+       hadj = .92)
+}
+# Extract the backtested days index, drop the first day which just consists of transaction costs.
+OOS_dayIndex <- which(apply(backtest_Port, 1, function(Row){any(!is.na(Row))}) == T)[-1]
+
+OOS_PortRet <- ((backtest_Port * cleanRet) %*% matrix(1, ncol = 1, nrow = ncol(cleanRet)))[OOS_dayIndex]
+names(OOS_PortRet) <- rownames(backtest_Port)[OOS_dayIndex]
+
+
+OOS_Trades <- rbind(backtest_Port[-1, ], 
+                    matrix(NA, nrow = 1, ncol = ncol(backtest_Port))) - 
+              backtest_Port
+
+OOS_Trades <- OOS_Trades[OOS_dayIndex, ]
+rownames(OOS_Trades) <- rownames(backtest_Port)[OOS_dayIndex]
+
+OOS_TCost <- rowSums(abs(OOS_Trades) * tcost[OOS_dayIndex, ] / 2, na.rm = T) 
+# mean(OOS_PortRet, na.rm = T); sd(OOS_PortRet, na.rm = T)
+# mean(OOS_PortRet, na.rm = T)/ sd(OOS_PortRet, na.rm = T) *sqrt(252)
+# plot(cumsum(na.omit(OOS_PortRet)), type = 'l') 
+
+OOS_netPort <- OOS_PortRet - OOS_TCost # Out of sample net portfolio returns
+
+OOS_cumNetRet <- cumsum(OOS_netPort) # Out of sample cumulative net returns
+
+OOS_Size <- rowSums(abs(backtest_Port[OOS_dayIndex, ]))
+
+mean(OOS_netPort, na.rm = T); sd(OOS_netPort, na.rm = T)
+mean(OOS_netPort, na.rm = T)/ sd(OOS_netPort, na.rm = T) * sqrt(252)
+# Sharpe ratio:
+mean(OOS_netPort / (.2 * OOS_Size) - .05/252) / 
+  sd(OOS_netPort / (.2 * OOS_Size)) * sqrt(252)
+paste0('T-Stat: ', mean(OOS_netPort, na.rm = T) / 
+         (sd(OOS_netPort, na.rm = T)/sqrt(length(na.omit(OOS_netPort)))))
+
+cor(cbind(OOS_netPort/(.2*OOS_Size), mktIndexRet[OOS_dayIndex]))
   
+# Drawdown
+drawDownMat <- sapply(seq_along(OOS_cumNetRet), function(dayInd){
+  rolling_draw <- OOS_cumNetRet[dayInd:length(OOS_cumNetRet)] - OOS_cumNetRet[dayInd]
+  return(c(rep(NA, dayInd - 1), 
+           rolling_draw))
+  }
+)
 
+drawDowns <- list()
 
+while(any(!is.na(drawDownMat))){
+  # Identify the top 3 draw downs and record them in a list:
+  currentDraw_Index <- which.min(apply(drawDownMat, 2, function(vec){
+    if(any(!is.na(vec))){return(min(vec, na.rm = T))
+    } else{return(10^6)}
+  }))
+  currentDraw_End <- which.min(drawDownMat[, currentDraw_Index])
+  drawDowns[[i]] <- drawDownMat[currentDraw_Index:currentDraw_End, currentDraw_Index]
+  if(length(drawDowns[[i]]) <= 2) break
+  
+  drawDownMat[, seq(currentDraw_Index,currentDraw_End)] <- NA
+  drawDownMat[-(1:currentDraw_Index), 1:currentDraw_Index] <- NA
+}
 
+# Market draw down: #NB: copying this over is not efficient but I only anticipate doing this twice.
+pltMktIndexRet <- c(0, na.omit(.2 * OOS_Size * mktIndexRet))
+drawDownMat <- sapply(seq_along(pltMktIndexRet), function(dayInd){
+  rolling_draw <- pltMktIndexRet[dayInd:length(pltMktIndexRet)] - pltMktIndexRet[dayInd]
+  return(c(rep(NA, dayInd - 1), 
+           rolling_draw))
+})
 
+mkt_drawDowns <- list()
 
+while(any(!is.na(drawDownMat))){
+  # Identify the top 3 draw downs and record them in a list:
+  currentDraw_Index <- which.min(apply(drawDownMat, 2, function(vec){
+    if(any(!is.na(vec))){return(min(vec, na.rm = T))
+    } else{return(10^6)}
+  }))
+  currentDraw_End <- which.min(drawDownMat[, currentDraw_Index])
+  mkt_drawDowns[[i]] <- drawDownMat[currentDraw_Index:currentDraw_End, currentDraw_Index]
+  if(length(mkt_drawDowns[[i]]) <= 2) break
+  
+  drawDownMat[, seq(currentDraw_Index,currentDraw_End)] <- NA
+  drawDownMat[-(1:currentDraw_Index), 1:currentDraw_Index] <- NA
+}
 
+# Create cumulative returns chart and comparison
+plot(OOS_cumNetRet, 
+     type = 'l', 
+     xlab = "", 
+     ylab = 'Net Cumulative Return (in \u20AC1,000)', 
+     xaxt = 'n', 
+     main = 'Strategy Cumulative Returns', 
+     ylim = c(-750, max(OOS_cumNetRet) + 750))
+polygon(x = c(seq_along(OOS_cumNetRet), rev(seq_along(OOS_cumNetRet))), 
+        y = c(OOS_cumNetRet, rep(0, length(OOS_cumNetRet))), 
+        col = 'darkolivegreen1', 
+        border = NA)
+lines(OOS_cumNetRet, 
+      col = 'green4', 
+      lwd = 1.25)
+createAxis()
 
-# *******************************************************************************
-###!!!!!! Everything below this line is essentially pseudocode for reference only
-# *******************************************************************************
-# # 3
-# # Short Term Mean Reversion over 21 days:
-# # This should only be evaluated per monthly universe
-# ST_Period <- 21
-# revWeights <- rev((1/11) - ((1/231) * (0:(21-1))))
-# alpharev <- apply(ret[, -(1:2)], 
-#                   2, 
-#                   function(x) {
-#                     zoo::rollapply(x, 
-#                       width = 21, 
-#                       FUN = function(x) {-mean(x * revWeights, na.rm = T)}, 
-#                       fill = NA, 
-#                       align = 'right')
-#                   })
-# 
-# 
-# 
-# 
-# 
-# 
-# 
-# 
-# # Alpha Rec:
-# recWeights <- rev((1/23) - ((1/1035) * (0:(45-1))))
-# alpharec <- apply(rec[, -(1:2)], 
-#                   2, 
-#                   function(x) {
-#                     zoo::rollapply(x, 
-#                                    width = 45, 
-#                                    FUN = function(x) {-mean(x * recWeights, na.rm = T)}, 
-#                                    fill = NA, 
-#                                    align = 'right')
-#                   })
-# 
-# # Alpha Val - take weighted values by day
-# alphaval <- apply(mtbv[, -(1:2)], 
-#                        1,
-#                        function(x) x/sum(x))
-# 
-# # Alpha Momentum
+for(i in 1:3){
+  # Shade the top 3 draw downs on the plot:
+  dayIndex <- which(names(OOS_cumNetRet) %in% names(drawDowns[[i]]))
+  polygon(x = unlist(mapply(list, range(dayIndex), range(dayIndex), SIMPLIFY = F)), # draws out the date arange
+          y = c(0, min(OOS_cumNetRet[dayIndex] - 400), rev(c(0, min(OOS_cumNetRet[dayIndex] - 400)))),
+          border = 'purple', 
+          lty = 3, 
+          lwd = .25)
+  polygon(x = c(dayIndex, rev(dayIndex)), # fills in the draw down area
+          y = c(OOS_cumNetRet[dayIndex] - 400, 
+                rep(min(OOS_cumNetRet[dayIndex] - 400), length(dayIndex))),
+          col = 'orange', border = 'purple')
 
-# # quodprog
-# mktRet <- 
-# apply(isactivenow[, -(1:2)], 
-#       1, 
-#       function(x) {
-#         activeUnivNum <- which(x == 1)
-#       })
-# mktRet <- sapply(isactivenow$Date, 
-#                  function(x) {
-#                    activeUniv <- unlist(isactivenow[Date == x, -(1:2)])
-#                    activeUniv <- names(activeUniv)[which(activeUniv == 1)]
-#                    capWeights <- unlist(cap[Date == x, activeUniv, with = F])
-#                    capWeights <- capWeights / sum(capWeights)
-#                    # print(x)
-#                    sum(unlist(ret[, activeUniv, with = F]) * capWeights)
-#                  })
-# 
-# activeUniv <- apply(isactivenow[, -(1:2)],
-#       1, 
-#       function(x) {
-#         which(x == 1) + 2
-#       })
-# 
-# capWghts <- sapply(1:nrow(cap), 
-#                    function(x){
-#                      activeCap <- unlist(cap[x, activeUniv[[x]], with = F])
-#                      activeCap/sum(activeCap, na.rm = T)
-#                    })
-# 
-# mktRet <- sapply(1:nrow(ret), 
-#                  function(x){
-#                    sum(unlist(ret[x, activeUniv[[x]], with = F]) *
-#                          capWghts[[x]])
-#                  })
-#            
-# univBetas <- lapply(ret[, -(1:2)], 
-#                     function(returns){
-#                       cat('I ')
-#                       shift(zoo::rollapply(seq_along(returns),
-#                                      width = 245, # Number of trading days for a year
-#                                      FUN = function(DTS){
-#                                       # lm(mktRet[DTS] ~ returns[DTS])$coef[2]
-#                                       X <- cbind(rep(1, 245), mktRet[DTS])
-#                                       # View(X)
-#                                       # browser()
-#                                       if(class(try(solve(m),silent=T))=="matrix"){return(NA)}
-#                                       (solve(t(X) %*% X) %*% t(X) %*% returns[DTS])[2]
-#                                      }, 
-#                                      fill = NA, 
-#                                      align = 'right'))
-#                     })
-# 
-# univBetas2 <- (do.call(cbind, univBetas))
-# # lm(ret[(1504-245):1504, 3][[1]]~mktRet[(1504-245):1504])$coef
-# 
-# # 4
-# 
-# countryDS <- unlist(allstocks[2, , ])
-# countryDS <- unlist(lapply(allstocks[2, , ], function(x) x[2]))
-#  
-# matF <- matrix(0, length(codesDS), length(unique(countryDS)))
-# 
-# countryDummy <- sapply(countryDS,
-#                    function(x) which(x == unique(countryDS))[1])
-# 
-# for (i in 1:nrow(matF)) {matF[i, countryDummy[i]] <- 1}
-# 
-# alphaRev2 <- as.matrix(apply(alpharev, 
-#                    2, 
-#                    function(x){
-#                      x[which(is.na(x))] <- 0
-#                      x
-#                    }))
-# 
-# tcost2 <- as.matrix(apply(tcost, 
-#                    2, 
-#                    function(x){
-#                      x[which(is.na(x))] <- .1
-#                      x
-#                    }))
-# 
-# ADV <- as.matrix(apply(copy(volume[, -(1:2)]),
-#              2,
-#               function(x){
-#                 newX <- zoo::rollapply(x, 
-#                                width = 245, 
-#                                FUN = function(subX){
-#                                  mean(subX, na.rm = T)
-#                                }, 
-#                                align = 'right', 
-#                                fill = NA)
-#                 newX[which(is.na(newX))] <- 0
-#                 newX
-#               }))
-# 
-# w <- matrix(rep(0, (ncol(ret)-2) * 246), ncol = length(codesDS), nrow = 246)
-# 
-# 
-# for (i in 246){
-#   fStar <- .1 # $100,000
-#   rStar <- .3 # $300,000
-#   theta <- pmax(.01 * ADV[i, ], .15) # S/B capped at 150000 
-#   mu <- .4
-#   lambda <- .4
-#   tau <- as.numeric(tcost2[i, (activeUniv[[i]]-2)])
-#   a <- alphaRev2[i, (activeUniv[[i]]-2)]
-#   
-#   Beta <- univBetas2[i, (activeUniv[[i]]-2)]
-#   
-#   sigMat <- cov(ret[(i-245):i, activeUniv[[i]], with = F])
-#   
-#   wghts <- w[i, (activeUniv[[i]]-2)]
-#   
-#   subR <- R[(activeUniv[[i]]-2), ]
-#   
-#   subF <- matF[(activeUniv[[i]]-2), ]
-#   
-#   # mat.u <- matrix(c(y, z), ncol = 1)
-#   # Need to define sigMat
-#   # Need to define w
-#   PI <- 1 # Max position size
-#   mat.H <- 2 * mu * cbind(rbind(sigMat, -sigMat), rbind(-sigMat, sigMat))
-#   mat.g <- rbind(2 * mu * sigMat %*% wghts - a + lambda * tau, 
-#                  -2 * mu * sigMat %*% wghts + a + lambda * tau)
-#   
-#   mat.A <- cbind(rbind(t(subR), -t(subR), t(subF), -t(subF)), 
-#                  rbind(-t(subR), t(subR), -t(subF), t(subF)))
-#   
-#   
-#   One <- matrix(rep(1, 40), ncol = 1)
-#   mat.b <- rbind(rStar * One - t(subR) %*% wghts, 
-#                  rStar * One + t(subR) %*% wghts, 
-#                  fStar * One - t(subF) %*% wghts, 
-#                  fStar * One + t(subF) %*% wghts)
-#   
-#   mat.C <- cbind(t(Beta), -t(Beta))
-#   
-#   mat.d <- -t(Beta) * w
-#   
-#   n <- ncol(ret)-2
-#   LB <- matrix(rep(0, 2*n), ncol = 1)
-#   
-#   UB <- rbind(pmax(0, pmin(theta, PI - w)), 
-#               pmax(0, pmin(theta, PI + w))) 
-# }
+}
+
+mktPerf <- cumsum(c(0, na.omit(.2 * OOS_Size * mktIndexRet))) 
+polygon(x = c(seq_along(OOS_cumNetRet), rev(seq_along(OOS_cumNetRet))), 
+        y = c(pmin(0, mktPerf), rep(0, length(mktPerf))), 
+        col = 'red', 
+        border = NA)
+polygon(x = c(seq_along(OOS_cumNetRet), rev(seq_along(OOS_cumNetRet))), 
+        y = c(pmax(0, mktPerf), rep(0, length(mktPerf))), 
+        col = 'gray83', 
+        border = NA)
+lines(mktPerf, 
+      col = 'gray20', 
+      lwd = 1.25)
+
+legend('topleft',
+       legend = c('Start Cumulative Net Return', 
+                  'Market Index Cumulative Return', 
+                  'Draw Down (top 3, offset on graph)'), 
+       lty = c(1, 1, NA),
+       lwd = c(2.75, 2.75, NA), 
+       col = c('green4', 'gray20', 'purple'), 
+       pt.cex = c(1, 1, 2), 
+       pch = c(NA, NA, 22), 
+       pt.bg = c(NA, NA, 'orange'), 
+       cex = .75,
+       text.width = 3.5,  
+       bty = 'n')
+
+pltOOS_Size <- na.omit(OOS_Size)
+plot(na.omit(pltOOS_Size), 
+     type = 'l', 
+     xlab = "", 
+     ylab = 'Total Book Size (in \u20AC1,000)', 
+     xaxt = 'n', 
+     main = 'Strategy Total Book Size')
+createAxis()
+
+polygon(x = c(seq_along(pltOOS_Size), rev(seq_along(pltOOS_Size))), 
+        y = c(pltOOS_Size, rep(min(pltOOS_Size), length(pltOOS_Size))), 
+        col = 'darkolivegreen1', 
+        border = NA)
+
+lines(pltOOS_Size)
+
+plot(na.omit(apply(OOS_Trades, 1, function(S){
+  if(any(!is.na(S))) {return(sum(abs(S), na.rm = T))
+  } else {return(NA)}
+})), type = 'p', ylab = 'Trade Size (\u20AC1000)')
+
+# Comparative stats:
+
+statsMat <- matrix(NA, nrow = 7, ncol = 2)
+rownames(statsMat) <- c('Annual Sharpe Ratio', 
+                        'Market correlation', 
+                        'Max drawdown', 
+                        'Longest drawdown', 
+                        'Average trade size', 
+                        'Skewness', 
+                        'Kurtosis')
+colnames(statsMat) <- c('Strategy', 'Market')
+
+statsMat[1, 1] <- mean((OOS_netPort / (.2 * OOS_Size))[testedIndex][-1] - .05 / 252) / 
+  sd((OOS_netPort / (.2 * OOS_Size))[testedIndex][-1]) * sqrt(252) # Sharpe ratio
+
+statsMat[1, 2] <- mean(mktIndexRet[testedIndex]) / sd(mktIndexRet[testedIndex]) *sqrt(252) # Mkt SR
+
+statsMat[2, ] <- cor(na.omit(cbind(OOS_netPort/(.2*OOS_Size), mktIndexRet)))[2, ]
+
+statsMat[3, ] <- c(min(unlist(lapply(drawDowns, min))), 
+                   min(unlist(lapply(mkt_drawDowns, min))))
+                   
+statsMat[4, ] <- c(max(unlist(lapply(drawDowns, length))), 
+                   max(unlist(lapply(mkt_drawDowns, length))))
+
+statsMat[5, 1] <- mean(rowSums(abs(OOS_Trades)), na.rm = T)
+
+statsMat[6, ] <- c(moments::skewness((OOS_netPort / (.2 * OOS_Size))[testedIndex][-1]), 
+                   moments::skewness(mktIndexRet[testedIndex]))
+
+statsMat[7, ] <- c(moments::kurtosis((OOS_netPort / (.2 * OOS_Size))[testedIndex][-1]), 
+                   moments::kurtosis(mktIndexRet[testedIndex]))
+
+statsMat <- round(statsMat, 4)
+
+# save.image(file='myEnvironment.RData')
