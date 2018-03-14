@@ -2,6 +2,9 @@
 ### End to end development
 Still a very much work in progress with a lot of comments for changes.
 
+3.13.18 Update:
+I got some feedback on the write up and made the changes which pushed back the publishing but it is now up!
+
 3.08.18 Update:
 I'm working on a summary write up and I'm going to post it tomorrow. My results are highly impressive.
 
